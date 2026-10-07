@@ -1,0 +1,189 @@
+# Torch Prefix-KV Parity Bisect (2026-10-06)
+
+Setup: Qwen3.5-4B base, bf16, CUDA 16G, transformers 5.18.0, text-only,
+2 same-type choice prompts (Ada/Lagos-Record), Referenz
+`candidate_logits_batch`. Skripte: `/tmp/gpu_bisect{,2,3,4,5}.py` (nicht im Repo).
+
+## Runden
+
+- **r1** (`gpu_bisect.py`): flat + hier, shared=53, suffix je 14.
+  `match=False max_delta=0.067`, argmax identisch. question_shared=0 →
+  Frage-Branch unschuldig. Gate-0.219 NICHT reproduziert (Gate nutzt
+  rotierte Panels ungleicher Länge + microbatch).
+- **r2** (`gpu_bisect2.py`): V1 ohne attention_mask 0.093 (Maske unschuldig);
+  V3 suffix-ohne-cache 7.5 (erwartbar kaputt, kein Signal); V2 fehlt
+  (Skriptfehler, keine Aussage).
+- **r3** (`gpu_bisect3.py`): direct-reuse 0.63 vs repeat-1 0.41.
+  Scheinbar Repeat-Effekt — aber r4 widerlegt (s.u.).
+- **r4** (`gpu_bisect4.py`): prefill mit/ohne Maske identisch 0.093;
+  **shared-copy-reuse 0.63** = Suffix-Call mutiert Cache trotz
+  `use_cache=False`. Frische Kopie pro Branch PFLICHT. r3-0.41 erklärt:
+  zweiter Branch las mutierten Cache.
+- **r5** (`gpu_bisect5.py`): shared=44, suffix 19/45/100 →
+  delta 14.8/13.3/0.016. Je mehr durch Prefix läuft, desto größer der
+  Fehler. Stärkste Spur: Prefix-Prefill ohne Maske vs seriell mit
+  (left-pad) bei ungleichen Längen. r1–r4 gleiche Längen → kein Pad →
+  Residuum 0.067.
+
+## Offene Hypothesen (priorisiert)
+
+1. **Hybrid-States (ZURÜCKGEZOGEN 11:20 — trifft falsche Klasse):**
+   Qwen3.5-`layer_types` = getrennt `linear_attention`/`full_attention`,
+   nie `hybrid`. Re-Bisect mit f55b7bc: same-B2 0.067 UNVERÄNDERT,
+   mixed-B2 0.108 (r5-14.8 kam vom falsch rechts-gepaddeten Ref, nicht
+   vom Prefix). Fix No-Op für dieses Modell, aber harmlos + getestet.
+   Laufzeit-Typen/Shape-Check am GPU-Cache steht noch aus.
+2. **Prefill-Maske (GESCHWÄCHT):** MLX prefillt ebenfalls ohne Maske und
+   funktioniert; Einzel-Prompts sind vor dem Split ungepaddet. r4 zeigte
+   Prefill mit/ohne Maske identisch (0.093). r5-Muster damit NICHT erklärt
+   (war Ref-Artefakt) — kein aktiver Fix-Kandidat mehr.
+3. **Referenz-Padding (GEKLÄRT):** r5 nutzte `processor(padding=True)`
+   = rechts, `collate` = links. Re-Bisect mit collate-Ref: mixed 0.108
+   statt 14.8. Lehre: Bisect-Refs immer via `collate` bauen.
+4. **Residuum 0.07–0.11 (OFFEN, einzige aktive Spur):** same 0.067,
+   mixed 0.108, argmax stabil, Logits ~21. Kandidaten: bf16-Rundung vs
+   Fallback-Kernel-Chunking (causal_conv1d/flash-Warnings). fp32-Kontrolle
+   OOM-unmöglich (15.6G). Nächste Sonden: Laufzeit-Cache-Typen/Shapes am
+   GPU-Cache; Gate-0.219 vs Bisect-0.067 Diskrepanz (rotierte Panels).
+
+## Neue Priorisierung nach Codevergleich (2026-10-06)
+
+1. **GDN-Split an 64er Chunkgrenze** — jetzt im Code umgesetzt, GPU-Parity
+   noch messen. HF Transformers 5.18.0 nutzt für Qwen3.5 `chunk_size=64`;
+   r1/r5 trennten bei 53/44 mitten im Chunk.
+2. **Cache branch state / B>1** — weiter prüfen; Branches müssen frische
+   Cache-Kopien bekommen und alle Linear-Attention-Zustände pro Row tragen.
+3. **bf16/kernel residue** — erst nach aligned split neu messen.
+4. **Prefill-Maske / Referenz-Padding** — herabgestuft: MLX prefillt ebenfalls
+   unmasked; der Live-Gate-Referenzpfad ist pro Prompt ungepaddet.
+
+Erwarteter nächster GPU-Test: exakt denselben Live-Gate-Probe mit
+`shared_prefix_tokens % 64 == 0` ausgeben und Candidate-vs-Reference delta +
+argmax messen. Keine Toleranz lockern.
+## Befund 11:35 — numerischer Parity-Floor B1 vs B=N (korrigiert, ex-Super-KI)
+
+Seriell B=1 vs B=2, identische Prompts: delta 0.177/0.071. Das ist KEINE
+Instabilität/Non-Determinismus (ungeprüft), sondern batch-shape-/kernel-
+Sensitivität: f(x,B=1) != exakt f(x,B=2) bei bf16+GDN. Korrekt formuliert:
+canonical-B1 und batched full-forward haben einen numerischen Parity-Floor
+von 0.07–0.18. GDN-aligned shared=128: delta 0.121, argmax stabil.
+Fazit: Gate verglich R1 (B=1 seriell) mit P (Prefix, suffix-Batch B=N) und
+mass damit cache-split + B=1→B=N + Kernel-Geometrie + bf16 aufsummiert.
+Fehlende Messung: R2 (full-forward B=N via collate) als Baseline, dann
+prefix_error = Δ(R2,P) statt total_error = Δ(R1,P).
+Messung 11:50 (shared=128, aligned): rep-B1=0, rep-B2=0 → deterministisch,
+"instabil" endgültig falsch. Aber: batch_noise 0.111/0.141, prefix_error
+Δ(R2,P) 0.083/0.121, total Δ(R1,P) 0.035/0.021. Super-KIs guter Fall
+(prefix_error ~0.008) trifft NICHT zu — Prefix hat echten Fehler ~0.1
+gegenüber gleichem Execution-Mode. argmax überall stabil. Fazit: kein
+Messartefakt mehr übrig; Restfehler sitzt im Prefix-Pfad selbst (split bei
+Messung 12:0x (5-Stufen-Leiter, frischer Prefill pro Stufe — Suffix-Calls
+mutieren Cache trotz use_cache=False, drift 26.7!): S1 no-copy 0.033, S2
+deepcopy 0.033 (Clone unschuldig), S3 repeat-B2-identisch 0.009 (Repeat
+unschuldig), S4 verschieden rowA 0.009/rowB 0.086. Sprung nur bei
+inhaltlich abweichendem Suffix. Split-Sweep rowB: 128→0.089, 130→0.030,
+133→0.013, 135→0.078, 143→0.015 — exakt reproduzierbar, aber ohne
+Chunk-Raster. Layer-Hooks: Drift 0.001 (l0) → 0.625 (l31), monoton
+akkumulierend, kein Sprung-Layer. Deutung: GDN-Recurrence setzt über Split
+nicht exakt fort (Fallback-Kernel, causal_conv1d+FLA fehlen); kleiner
+Anfangsfehler verstärkt sich pro Layer. Deterministisch, argmax-stabil.
+Messung 12:4x (FLA 0.5.2 aktiv via triton 3.8.0, causal_conv1d fehlt weiter —
+CUDA-Mismatch, nicht baubar): S1 0.033→0.137 (SCHLECHTER), S3 0.009→0.006,
+S4-rowB 0.086→0.075. Micro-Test synthetisch: chunk-split==full (1.5e-5),
+Chunk-Decomposition unschuldig; qkv-preconv exakt 0, Drift entsteht in
+Conv/GDN. Fazit: Split-Fehler kernel-abhängig, aber kein Kernel-Pfad führt
+zu Parity. Gate-Entscheidung nötig (Pfad meiden vs Floor-Toleranz), keine
+weitere Messung.
+Rollback 12:5x: triton 3.8.0→3.1.0, FLA/fla-core deinstalliert, Smoke grün
+(Fallback-Warnungen zurück, Logit-Max 18.4 plausibel). Beschluss: kein
+experimenteller Kernel-Pfad im Serving-Stack; ggf. separater Container.
+Win-Messung 12:6x (4 Fragen/4 Rotationen, shared-prefix 448 Tok, text-only):
+serial 3.32s vs prefix 0.64s = 5.20x; 12 Fragen: 9.65s vs 1.56s = 6.20x.
+Decision-Parity 12/12 (inkl. knapper Margins Q8/Q10, Drift ohne Flip),
+max prob-delta 0.05. Gate (argmax + MARGIN_FLOOR) trägt: klare Fälle prefix,
+knappe seriell. Fazit: Production-Win bei 4x-Sampling.
+
+Messung 13:x (HEAD 9803309, Cross-Question-Batching, Wiki 35Qx4 fast=True):
+serial 17.2s / batch 13.4s / gate 9.2s = gate_vs_batch 1.46x (vorher 1.26x),
+parity_gate 34/35, batch 32/35, fb 8. Q-Prefills gleiche-Laenge-gepackt
+(8 Batches statt 35xB1), Suffixe pro Frage aus In-Place-expandiertem Cache
+(OOM-Fix: kein Deepcopy). Alle q_shared=64 (raw 65-73). B2-Q-Prefill-Drift
+0.09 (Sonden) traegt nicht bis Logit/Argmax durch — Tiling-Rauschen, kein
+Gate-Risiko. 50.2-Ausreisser war Sonden-Artefakt (Padding+Inhalt gemischt).
+
+Messung 14:x (267a022, Margin-Fallback entfernt, Showdown p50 n=35 rot4 mb16):
+serial 17.3s / batch 14.6s / warm-gate 5.1s = 2.84x vs batch, 3.37x vs serial,
+Paritaet 34/35 (Q17: serial true@0.003 vs prefix false@0.001 — beidseitiges
+Raten, kein Prefix-Fehler). Phasen (sync): global 1xB1x128 0.07s + Q-Prefills
+8xB4-5x64 0.99s (19%) + Suffixe 8xB13-16x45-87 3.83s (74%) + repeat 0.05s.
+Faktoren: 1. Suffix GDN-Fallback-Kernel (FLA/causal_conv1d fehlen), 2. Q-Prefill
+Launches B4-5 (alle q_shared=64, ein B35-Batch moeglich?), 3. Suffix-Laengen
+45-87T, 4. Vision/CPU marginal. Showdown-OOMs unterwegs: fehlendes
+inference_mode (Autograd hielt 140 Graphen/4.6GB) + 16 Graph-Laengen (~4GB).
+
+Investigation 15:x (B35 Q-Prefill-Hebel, nur Sonden in /tmp, kein Repo-Touch):
+Alle 35 q_shared=64 (Counter bestaetigt). B35-vs-serial K/V-Drift 0.062 (Q0)
+bis worst 0.125 ueber 35 Rows — im Bereich des Parity-Floors (Spot 0.02-0.03
+B1-vs-B4 als Referenz). End-to-end Logit-Impact Q0 Rotation 0: Delta 0.084,
+kein Argmax-Flip. Risiko: Fragen mit Margin <0.1 koennten flippen — Q17
+(0.003/0.001) wuerde flippen. Ersparnis ~0.8s (8 Launches -> 1). Suffixe sind
+bereits fragenuebergreifend gebatcht (8 Batches a B13-16 aus 140 Rows);
+Microbatch 16->35 spart nur Launch-Overhead bei gleichen FLOPs (klein).
+74%-Block bleibt GDN-Fallback-Kernel (FLA/causal_conv1d fehlen) — Container/
+Install ist der grosse Hebel, kein Code-Change. Decke ohne Kernel: ~4s.
+
+Kernel-Versuch 15:x (Env torch 2.5.1+cu121 / triton 3.1.0 / transformers 5.18):
+causal-conv1d nur Source (kein cu121-Wheel, Build faellt ueber urllib-Download).
+FLA 0.5.2 installiert, Dispatch aktiv (kein Fallback-Warning), aber Autotuner
+crasht (do_bench vs triton 3.1). FLA 0.4.2: STAGE-Parse-Fehler (braucht triton
+3.2+). Triton 3.2/3.3 bricht torch.compile (dataclass-TypeError) — REVERT auf
+3.1.0, Env wieder sauber. FAZIT (ex-Super-KI bestaetigt): FLA-Linie verlangt
+inzwischen torch>=2.7 + triton>=3.3 — Kernel-Weg im aktuellen Production-Stack
+nicht sinnvoll weiterverfolgbar; Kernel-Experiment gehoert in separaten
+modernen Container (torch>=2.7, triton>=3.3, current FLA + causal-conv1d, dann
+exakt unser Showdown dagegen). Offener isolierter Test ohne Env-Risiko:
+causal-conv1d-Wheel fuer torch 2.5.1/cu121 via Astral-GPU-Index
+(astral-sh-build/build-causal-conv1d) — rettet nur die Conv-Komponente, nicht
+den 74%-Block (FLA fehlt weiter). Laufende Hebel ohne Env-Risiko:
+Suffix-Bucketing + Q-Prefill-Sweeps (docs/prefix-scheduler-benchmarks.md).
+
+Messung 16:x (Scheduler-Sweep + Produktion-Showdown, bucket=8, qbatch=0):
+Sweep: bucket=8 gewinnt (-11.5%, 4.85s->4.30s, keine Flips, pad 17%->2.7%).
+Alle qbatch>0 flippen (34/35, neuer Flip vs Baseline) -> disqualifiziert, B35
+faellt unter Promotion-Regel raus. Showdown (5 runs): serial 17.8s / batch
+14.6s / warm-gate 4.46s = 3.28x vs batch, 3.99x vs serial. Paritaet 34/35
+(Q17-Coin-Flip). Batch 32/35 (Q5/Q24/Q26) — Q5-serial selbst __unknown__@0.014
+(kein Entscheid), Batch dort Elfyn Evans@0.476: Flip gegen Serial-Nichtantwort,
+nicht gegen Serial-Wissen.
+
+Messung 17:x (causal-conv1d isoliert, Astral-Wheel 1.7.0+cu12.1.torch2.5):
+kein Fallback-Warning mehr, warm-gate 4.56s vs 4.46s ohne (=Rauschen, kein
+Gewinn). Bestaetigt Super-KI-Einschaetzung: Conv-Komponente allein rettet den
+74%-Block nicht (FLA fehlt weiter). Wheel wieder deinstalliert, Env sauber
+(triton 3.1.0, torch cu121). NOTE: Serial-Baseline schwankt run-zu-run
+(Q17 serial true@0.003 vs false@0.011) — Coin-Flip-Fragen sind instabil,
+nicht nur prefix-seitig.
+
+Messung 18:x (Bucket-Luecke 4, mb16, 3 runs): bucket=4 4.375s vs bucket=8
+4.435s (Δ1.4%, p95 ueberlappt, beide pad 2.7%, keine Flips). Kein neuer
+Gewinner — Rauschen. Bucket=8 bleibt Default-Kandidat (eine Showdown-
+Wiederholung + Promotion fehlt noch).
+
+Messung 19:x (Microbatch-Luecke, bucket=8): mb24 Sweep 4.35s (baseline 34/35
+vs eigene B0-Baseline) — Showdown-Klaerung: warm-gate 4.52s, 35/35 vs Serial,
+kein Kandidat-Flip (B0-Baseline selbst weicht ab). mb32 Sweep 4.54s, 35/35
+sauber aber langsamer als mb16. FAZIT: mb16/bucket=8 bleibt (4.46s), mb24
+gleichwertig im Rauschen, mb32 langsamer. Alle Q-Prefill-Batches >0 weiter
+disqualifiziert.
+
+Messung 20:x (Showdown-Wiederholung, mb16/bucket=8, 5 runs): warm-gate 4.39s
+(3.21x vs batch, 3.88x vs serial), 34/35 (Q17-Flip). Promotion-Regel erfuellt:
+kein neuer Flip, serial nicht schlechter, p50-Gewinn ~10% aus Sweep-In-Run
+(4.30 vs 4.85, Messung 16:x — Showdown lief nur bucket=8 ohne eigene B0-
+Kontrolle), VRAM 10.13GiB im Budget. Bucket=8 → Server-Default promoten
+(upstream 95df316, volle Promotion alle Defaults).
+
+Messung 21:x (Bucket=4 x QBatch-Kreuz, mb16): alle qbatch>0 flippen auch bei
+bucket=4 (34/35, langsamer: 4.5-4.7s). qbatch=0 bleibt (4.34s, 35/35).
+Sweep-Raum erschöpft: bucket 0/4/8/16/24/32, mb 16/24/32, qbatch 0/4/8/12/16/35
+bei bucket=4+8. Gewinner: mb16/bucket=8/qbatch=0 (Server-Default).
