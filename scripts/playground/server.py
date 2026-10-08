@@ -514,7 +514,10 @@ def create_app(backend, examples=None, static=STATIC, calibration=None, thinking
                        for field, result in zip(request.fields, results)]
         body = to_response(request, results, model=backend.model, plan=plan)
         total_ms = round((perf_counter() - started) * 1000, 1)
-        body["usage"] = {**usage, "total_ms": total_ms,
+        # SystemOne contract: jev-mcp requires finite non-negative input_tokens/output_tokens.
+        # Imajev is a classifier (no generated tokens) so output_tokens is honestly 0.
+        body["usage"] = {"input_tokens": int(usage.get("input_tokens", 0)), "output_tokens": 0,
+                         **usage, "total_ms": total_ms,
                          "images": [{k: meta[k] for k in ("sha256", "width", "height")} for _, meta in loaded]}
         abstained = sum(1 for answer in body["answers"].values() if answer["abstained"])
         log.info("%s  images=%d questions=%d total_ms=%.1f abstained=%d",
